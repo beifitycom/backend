@@ -1,0 +1,56 @@
+📂 backend/
+    📄 .env                      # Environment variables
+    📄 .gitignore               # Git ignore file
+    📄 app.js                   # Main entry point (minimal, mounts middleware/routes)
+    📂 config/                  # Configuration files
+        📄 cloudinary.js        # Cloudinary setup
+        📄 cors.js              # CORS configuration
+        📄 db.js                # Database connection
+        📄 env.js               # Environment variable validation (new)
+        📄 firebase.js          # Firebase Admin SDK setup (new)
+        📄 passport.js          # Passport configuration
+        📄 session.js           # Session configuration
+        📄 webpush.js           # Webpush configuration
+    📂 controllers/             # Business logic for routes and Socket.IO
+        📄 authController.js
+        📄 listingController.js # Renamed for consistency
+        📄 messageController.js
+        📄 notificationController.js
+        📄 orderController.js   # Capitalized for consistency
+        📄 reportController.js
+        📄 socketController.js  # Socket.IO event handlers (new)
+        📄 userController.js
+    📂 logs/                    # Winston log files
+        📄 error.log
+        📄 combined.log
+        📄 exceptions.log
+    📂 middleware/              # Custom middleware
+        📄 authMiddleware.js
+        📄 errorHandler.js
+        📄 logger.js            # Winston HTTP logging middleware (renamed)
+    📂 models/                  # Mongoose models
+        📄 Listing.js           # Capitalized for consistency
+        📄 Message.js
+        📄 Notification.js      # Renamed for consistency
+        📄 Order.js             # Capitalized for consistency
+        📄 Report.js            # Capitalized for consistency
+        📄 ResetToken.js        # Capitalized for consistency
+        📄 Token.js             # Capitalized for consistency
+        📄 User.js              # Capitalized for consistency
+    📄 package-lock.json
+    📄 package.json
+    📂 routes/                  # Express route definitions
+        📄 authRoutes.js
+        📄 cloudinaryRoutes.js  # Cloudinary endpoints (new)
+        📄 listingRoutes.js
+        📄 messageRoutes.js     # Renamed for consistency
+        📄 notificationRoutes.js # Renamed for consistency
+        📄 orderRoutes.js
+        📄 reportRoutes.js
+        📄 userRoutes.js
+    📂 utils/                   # Utility functions
+        📄 helper.js
+        📄 logger.js            # Winston logger setup
+        📄 sendEmail.js
+        📄 socket.js            # Socket.IO server setup (new)
+    📄 vercel.json              # Vercel deployment config
