@@ -173,7 +173,7 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
       channel_id: process.env.SWIFT_CHANNEL_ID || "000146",  // From env if set
       account_reference: `ORDER-${order.orderId}`,
       transaction_desc: `Payment for Order #${order.orderId}`,
-      callback_url: `${process.env.DOMAIN || 'https://beifitycom-backend-production.up.railway.app'}/api/payments/webhook/swift`,
+      callback_url: `${process.env.DOMAIN || 'https://beifity-com-backend.onrender.com'}/api/payments/webhook/swift`,
     };
 
     // Call SWIFT API
