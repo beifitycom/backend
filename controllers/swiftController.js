@@ -20,6 +20,59 @@ import { sendNotification } from './notificationController.js';
 import { calculateServiceFee } from '../utils/helper.js';
 import { listingModel } from '../models/Listing.js';
 
+// Manual SWIFT API test function (can be called from console)
+export const manualSwiftTest = async (reference) => {
+  console.log(`\n=== MANUAL SWIFT API TEST for ${reference} ===`);
+
+  try {
+    const response = await fetch('https://swiftwallet.co.ke/v3/transactions/', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${process.env.SWIFT_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const data = await response.json();
+    console.log('Raw SWIFT API response:', JSON.stringify(data, null, 2));
+
+    // Look for the specific transaction - SWIFT API structure: { success: true, data: { transactions: [...] } }
+    let transactions = [];
+    if (data && data.success && data.data && Array.isArray(data.data.transactions)) {
+      transactions = data.data.transactions;
+    } else if (data && data.success && Array.isArray(data.transactions)) {
+      transactions = data.transactions;
+    } else if (Array.isArray(data)) {
+      transactions = data;
+    } else if (data && Array.isArray(data.data)) {
+      transactions = data.data;
+    }
+
+    console.log(`Found ${transactions.length} transactions in response`);
+
+    const ourTransaction = transactions.find(tx => tx.external_reference === reference);
+    if (ourTransaction) {
+      console.log('✅ Found our transaction:', JSON.stringify(ourTransaction, null, 2));
+      console.log(`Status: ${ourTransaction.status}`);
+      console.log(`Amount: ${ourTransaction.amount}`);
+      console.log(`Transaction Date: ${ourTransaction.transaction_date}`);
+      console.log(`Processed At: ${ourTransaction.processed_at}`);
+      console.log(`Is completed: ${ourTransaction.status === 'completed' || ourTransaction.status === 'success'}`);
+      console.log(`M-Pesa Receipt: ${ourTransaction.mpesa_receipt_number}`);
+    } else {
+      console.log(`❌ Transaction with reference ${reference} not found in SWIFT response`);
+      console.log('Sample external_references found:', transactions.slice(0, 5).map(tx => tx.external_reference).filter(Boolean));
+      console.log('All statuses found:', [...new Set(transactions.map(tx => tx.status))]);
+    }
+
+    return { success: true, data, ourTransaction };
+
+  } catch (error) {
+    console.error('Manual SWIFT test error:', error);
+    return { success: false, error: error.message };
+  }
+};
+
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.beifity.com';
 const commissionRate = parseFloat(process.env.COMMISSION_RATE || '0'); // 5% platform commission
 const swift = axios.create({
@@ -211,6 +264,92 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
     return { error: true, message: error.message };
   }
 };
+// Helper function to process payment completion (simplified version for verification updates)
+const processPaymentCompletion = async (transaction, order, session) => {
+  try {
+    logger.info(`Processing payment completion for transaction ${transaction.swiftReference}`);
+
+    // Populate order with necessary data
+    await order.populate('customerId items.sellerId');
+
+    const itemsTotal = transaction.items.reduce((sum, item) => sum + (item.itemAmount || 0), 0);
+    const commissionRate = parseFloat(process.env.COMMISSION_RATE || '0');
+
+    // Recalculate shares and commissions
+    for (const transactionItem of transaction.items.filter(item => !(item.cancelled ?? false))) {
+      const itemAmount = transactionItem.itemAmount || 0;
+      const proratedCommission = itemsTotal > 0 ? (itemAmount / itemsTotal) * (itemsTotal * commissionRate) : 0;
+      transactionItem.platformCommission = proratedCommission;
+      transactionItem.sellerShare = itemsTotal > 0 ? (itemAmount / itemsTotal) * (itemsTotal - transaction.swiftServiceFee - (itemsTotal * commissionRate)) : 0;
+      transactionItem.transferFee = 0;
+      transactionItem.netCommission = proratedCommission;
+      transactionItem.owedAmount = transactionItem.sellerShare;
+    }
+
+    await transaction.save({ session });
+
+    // Update platform balance
+    const totalPlatformCommission = transaction.items.reduce((sum, item) => sum + item.platformCommission, 0);
+    const platformBalance = transaction.swiftServiceFee + transaction.deliveryFee + totalPlatformCommission;
+
+    const admin = await userModel.findOne({ 'personalInfo.isAdmin': true }).session(session);
+    if (admin) {
+      await userModel.findByIdAndUpdate(
+        admin._id,
+        { $inc: { 'financials.balance': platformBalance } },
+        { session }
+      );
+      logger.info(`Platform balance updated: +KES ${platformBalance} for verified transaction ${transaction.swiftReference}`);
+    }
+
+    // Group sellers and update their balances
+    const sellerGroups = {};
+    for (const txItem of transaction.items.filter(item => !item.cancelled)) {
+      const sellerIdStr = txItem.sellerId.toString();
+      if (!sellerGroups[sellerIdStr]) {
+        sellerGroups[sellerIdStr] = { sellerId: txItem.sellerId, totalShare: 0, items: [] };
+      }
+      sellerGroups[sellerIdStr].totalShare += txItem.sellerShare;
+      sellerGroups[sellerIdStr].items.push(txItem);
+    }
+
+    for (const [sellerIdStr, group] of Object.entries(sellerGroups)) {
+      await userModel.findByIdAndUpdate(
+        group.sellerId,
+        {
+          $inc: {
+            'financials.balance': group.totalShare,
+            'analytics.salesCount': group.items.length,
+            'analytics.totalSales.amount': group.totalShare,
+          }
+        },
+        { session }
+      );
+      logger.info(`Seller ${sellerIdStr} balance updated: +KES ${group.totalShare} for verified transaction ${transaction.swiftReference}`);
+    }
+
+    // Update buyer and seller stats
+    await userModel.updateOne(
+      { _id: order.customerId._id },
+      { $inc: { 'stats.pendingOrdersCount': -1 } },
+      { session }
+    );
+
+    for (const sellerId of [...new Set(order.items.filter(i => !i.cancelled).map(i => i.sellerId))]) {
+      await userModel.updateOne(
+        { _id: sellerId },
+        { $inc: { 'stats.pendingOrdersCount': -1 } },
+        { session }
+      );
+    }
+
+    logger.info(`Payment completion processing finished for transaction ${transaction.swiftReference}`);
+  } catch (error) {
+    logger.error(`Error processing payment completion for ${transaction.swiftReference}: ${error.message}`, { stack: error.stack });
+    // Don't throw - we want verification to succeed even if some post-processing fails
+  }
+};
+
 // Verify Transaction (for polling; real confirmation via webhook)
 export const verifyTransaction = async (reference) => {
   const session = await mongoose.startSession();
@@ -243,33 +382,165 @@ export const verifyTransaction = async (reference) => {
       };
     }
 
-    // For SWIFT, no direct verify—poll status or wait for webhook. Here, check if webhook processed.
-    // If not 'completed', return pending.
-    if (existingTransaction.status !== 'completed') {
-      logger.info(`Transaction ${reference} still pending`, { reference, currentStatus: existingTransaction.status });
-      return {
-        error: false,
-        data: {
-          status: 'pending',
-          amount: existingTransaction.totalAmount,
-          paymentMethod: existingTransaction.paymentMethod,
-          paidAt: null,
-        },
-      };
-    }
+    // For SWIFT: If not completed locally, check with SWIFT API
+    logger.info(`Transaction ${reference} not completed locally, checking with SWIFT API`, { reference, currentStatus: existingTransaction.status });
 
+    // Commit current transaction first since we're done with DB read
     await session.commitTransaction();
     committed = true;
-    logger.info(`Transaction verified successfully (via poll)`, { reference });
+    session.endSession();
+
+    // Check with SWIFT API
+    try {
+      console.log(`Checking SWIFT API for reference: ${reference}`);
+
+      // SWIFT API - use the exact same call that worked for the user
+      const swiftResponse = await withRetry(
+        async () => {
+          const response = await fetch('https://swiftwallet.co.ke/v3/transactions/', {
+            method: 'GET',
+            headers: {
+              'Authorization': 'Bearer sw_f451ace91b204841269a03acd7df428a635b98fc44d49d54af5aa8b3',
+              'Content-Type': 'application/json'
+            }
+          });
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+          }
+
+          return response.json();
+        },
+        3,
+        `Verify transaction status with SWIFT API for ${reference}`
+      );
+
+      const swiftData = swiftResponse;
+      console.log('SWIFT API verification response:', JSON.stringify(swiftData, null, 2));
+
+      // Check various possible response structures
+      let swiftTransaction = null;
+      let allTransactions = [];
+
+      // Structure 1: { success: true, data: { transactions: [...] } } - This is the correct one based on your response
+      if (swiftData && swiftData.success && swiftData.data && Array.isArray(swiftData.data.transactions)) {
+        allTransactions = swiftData.data.transactions;
+        swiftTransaction = allTransactions.find(tx => tx.external_reference === reference);
+      }
+      // Structure 2: { success: true, transactions: [...] }
+      else if (swiftData && swiftData.success && Array.isArray(swiftData.transactions)) {
+        allTransactions = swiftData.transactions;
+        swiftTransaction = allTransactions.find(tx => tx.external_reference === reference);
+      }
+      // Structure 3: Direct array response
+      else if (Array.isArray(swiftData)) {
+        allTransactions = swiftData;
+        swiftTransaction = allTransactions.find(tx => tx.external_reference === reference);
+      }
+      // Structure 4: { data: [...] }
+      else if (swiftData && Array.isArray(swiftData.data)) {
+        allTransactions = swiftData.data;
+        swiftTransaction = allTransactions.find(tx => tx.external_reference === reference);
+      }
+
+      console.log(`Found ${allTransactions.length} transactions from SWIFT API`);
+      console.log(`Transaction ${reference} found:`, !!swiftTransaction);
+
+      console.log('Found SWIFT transaction:', swiftTransaction);
+
+      if (swiftTransaction && (swiftTransaction.status === 'completed' || swiftTransaction.status === 'success')) {
+        logger.info(`Transaction ${reference} confirmed as completed by SWIFT API, updating local database`, {
+          reference,
+          swiftStatus: swiftTransaction.status,
+          swiftAmount: swiftTransaction.amount,
+          swiftTransaction: JSON.stringify(swiftTransaction, null, 2)
+        });
+
+        // Update local database to mark as completed
+        const updateSession = await mongoose.startSession();
+        updateSession.startTransaction();
+
+        try {
+          // Extract completion timestamp - SWIFT API uses processed_at and transaction_date
+          let paidAt = new Date();
+          if (swiftTransaction.processed_at) {
+            paidAt = new Date(swiftTransaction.processed_at);
+          } else if (swiftTransaction.transaction_date) {
+            paidAt = new Date(swiftTransaction.transaction_date);
+          } else if (swiftTransaction.created_at) {
+            paidAt = new Date(swiftTransaction.created_at);
+          } else if (swiftTransaction.updated_at) {
+            paidAt = new Date(swiftTransaction.updated_at);
+          }
+
+          // Update transaction status
+          const updatedTransaction = await TransactionModel.findOneAndUpdate(
+            { swiftReference: reference },
+            {
+              status: 'completed',
+              paidAt: paidAt,
+              swiftServiceFee: swiftTransaction.fee || swiftTransaction.service_fee || existingTransaction.swiftServiceFee
+            },
+            { session: updateSession, new: true }
+          );
+
+          if (updatedTransaction) {
+            // Update order status
+            const orderUpdate = await orderModel.findOneAndUpdate(
+              { orderId: updatedTransaction.orderId },
+              { status: 'paid' },
+              { session: updateSession }
+            );
+
+            if (orderUpdate) {
+              logger.info(`Successfully updated local database for transaction ${reference} based on SWIFT confirmation`);
+
+              // Process the payment completion logic (similar to webhook but simplified)
+              await processPaymentCompletion(updatedTransaction, orderUpdate, updateSession);
+            }
+          }
+
+          await updateSession.commitTransaction();
+          updateSession.endSession();
+
+          return {
+            error: false,
+            data: {
+              status: 'completed',
+              amount: existingTransaction.totalAmount,
+              paymentMethod: existingTransaction.paymentMethod,
+              paidAt: paidAt,
+              confirmedBySwift: true
+            },
+          };
+        } catch (updateError) {
+          await updateSession.abortTransaction();
+          updateSession.endSession();
+          logger.error(`Failed to update local database for SWIFT-confirmed transaction ${reference}: ${updateError.message}`);
+          throw updateError;
+        }
+      } else {
+        logger.info(`Transaction ${reference} still pending according to SWIFT API`, {
+          reference,
+          swiftStatus: swiftTransaction?.status || 'not found'
+        });
+      }
+    } catch (swiftError) {
+      logger.error(`Error checking transaction status with SWIFT API for ${reference}: ${swiftError.message}`);
+      // Continue with local pending status if SWIFT check fails
+    }
+
+    // Return pending if SWIFT didn't confirm completion or API failed
     return {
       error: false,
       data: {
-        status: 'completed',
+        status: 'pending',
         amount: existingTransaction.totalAmount,
         paymentMethod: existingTransaction.paymentMethod,
-        paidAt: existingTransaction.paidAt,
+        paidAt: null,
       },
     };
+
   } catch (error) {
     if (!committed) {
       await session.abortTransaction();
@@ -278,7 +549,74 @@ export const verifyTransaction = async (reference) => {
     logger.error(`Error verifying transaction: ${error.message}`, { stack: error.stack, reference });
     return { error: true, message: error.message };
   } finally {
-    session.endSession();
+    if (!committed) {
+      session.endSession();
+    }
+  }
+};
+
+// Manual SWIFT API Test Endpoint (for debugging)
+export const testSwiftApi = async (req, res) => {
+  try {
+    const { reference } = req.params;
+
+    if (!reference) {
+      return res.status(400).json({ error: true, message: 'Reference is required' });
+    }
+
+    console.log(`Testing SWIFT API for reference: ${reference}`);
+
+    // Test the SWIFT API call - use exact same call that worked for user
+    const swiftResponse = await withRetry(
+      async () => {
+        const response = await fetch('https://swiftwallet.co.ke/v3/transactions/', {
+          method: 'GET',
+          headers: {
+            'Authorization': 'Bearer sw_f451ace91b204841269a03acd7df428a635b98fc44d49d54af5aa8b3',
+            'Content-Type': 'application/json'
+          }
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        return response.json();
+      },
+      3,
+      `Test SWIFT API for ${reference}`
+    );
+
+    const swiftData = swiftResponse;
+    console.log('SWIFT API raw response:', JSON.stringify(swiftData, null, 2));
+
+    // Try to find the transaction
+    let swiftTransaction = null;
+
+    // Check various response structures
+    if (swiftData && swiftData.success && swiftData.data && Array.isArray(swiftData.data.transactions)) {
+      swiftTransaction = swiftData.data.transactions.find(tx => tx.external_reference === reference);
+    } else if (swiftData && swiftData.success && Array.isArray(swiftData.transactions)) {
+      swiftTransaction = swiftData.transactions.find(tx => tx.external_reference === reference);
+    } else if (Array.isArray(swiftData)) {
+      swiftTransaction = swiftData.find(tx => tx.external_reference === reference);
+    } else if (swiftData && Array.isArray(swiftData.data)) {
+      swiftTransaction = swiftData.data.find(tx => tx.external_reference === reference);
+    }
+
+    return res.status(200).json({
+      success: true,
+      reference,
+      swiftResponse: swiftData,
+      foundTransaction: swiftTransaction,
+      transactionStatus: swiftTransaction?.status,
+      isCompleted: swiftTransaction && (swiftTransaction.status === 'completed' || swiftTransaction.status === 'success')
+    });
+
+  } catch (error) {
+    console.error('SWIFT API test error:', error);
+    logger.error(`SWIFT API test error for ${req.params.reference}: ${error.message}`, { stack: error.stack });
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 

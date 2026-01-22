@@ -104,7 +104,7 @@ app.get('/', (req, res) => res.send('BeiFity API is running!'));
 
 
 // Start the server
-const PORT =  4000;
+const PORT = process.env.PORT || 4001;
 server.listen(PORT, () => {
   logger.info(`Server running in ${env.NODE_ENV} mode on port ${PORT} --> http://localhost:${PORT}`);
 });
