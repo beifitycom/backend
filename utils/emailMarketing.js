@@ -85,7 +85,7 @@ export const marketingEmailJob = cron.schedule('0 */5 * * *', async () => {
     const recentUserIds = recentEmails.map(log => log.userId.toString());
     let eligibleUsers = allUsers
       .filter(user => !recentUserIds.includes(user._id.toString()))
-      .slice(0, 5); // Take up to 5 users
+      .slice(0, 10); // Take up to 5 users
 
     // If no eligible users, reset rotation by selecting least recently contacted
     if (eligibleUsers.length === 0) {
