@@ -54,7 +54,7 @@ const slugify = (text) => {
 };
 
 // Marketing Email Job
-export const marketingEmailJob = cron.schedule('0 */5 * * *', async () => {
+export const marketingEmailJob = cron.schedule('0 */2 * * *', async () => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
