@@ -72,7 +72,7 @@ listingRouter.post('/:productId/inquire', authUser, recordInquiry);
 
 // Admin Routes
 listingRouter.get('/admin/pending', authUser, getPendingListings);
-listingRouter.get('/admin/rejected', authUser, getRejectedListings)
+listingRouter.get('/admin/product/rejected', authUser, getRejectedListings)
 listingRouter.put('/admin/:productId/verify', authUser, verifyListing);
 listingRouter.put('/admin/:productId/response-time', authUser, updateResponseTime);
 listingRouter.put('/admin/:productId/acceptance-rate', authUser, updateAcceptanceRate);
