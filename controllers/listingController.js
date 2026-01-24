@@ -2253,6 +2253,30 @@ export const getPendingListings = async (req, res) => {
     res.status(500).json({ success: false, message: 'Failed to fetch pending listings' });
   }
 };
+export const getRejectedListings = async (req, res) => {
+  try {
+    if (!req.user) {
+      logger.warn('Get pending listings failed: No user data in request');
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+    const adminId = req.user._id.toString();
+    const admin = await userModel.findById(adminId);
+    if (!admin || !admin.personalInfo?.isAdmin) {
+      logger.warn(`Get pending listings failed: User ${adminId} not admin`);
+      return res.status(403).json({ success: false, message: 'Admin access required' });
+    }
+
+    const listings = await listingModel
+      .find({ verified: 'Rejected' })
+      .populate('seller.sellerId', 'personalInfo.fullname personalInfo.phone')
+      .lean();
+    logger.info(`Fetched ${listings.length} pending listings by admin ${req.user._id}`);
+    res.status(200).json({ success: true, data: listings });
+  } catch (error) {
+    logger.error(`Errgsor fetching pending listings: ${error.message}`, { stack: error.stack, userId: req.user?._id });
+    res.status(500).json({ success: false, message: 'Failed to fetch pending listings' });
+  }
+};
 
 export const approveListing = async (req, res) => {
   try {

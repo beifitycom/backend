@@ -32,7 +32,8 @@ import {
   recordNegotiation,
   approveListing,
   recordInquiry,
-  verifyListing
+  verifyListing,
+  getRejectedListings
 } from '../controllers/listingController.js';
 import { authUser } from '../middlewares/authMiddleware.js';
 import { bulkToggleListingOffer, toggleListingOffer } from '../controllers/AdminControllers/ListingAdminController.js';
@@ -71,6 +72,7 @@ listingRouter.post('/:productId/inquire', authUser, recordInquiry);
 
 // Admin Routes
 listingRouter.get('/admin/pending', authUser, getPendingListings);
+listingRouter.get('/admin/rejected', authUser, getRejectedListings)
 listingRouter.put('/admin/:productId/verify', authUser, verifyListing);
 listingRouter.put('/admin/:productId/response-time', authUser, updateResponseTime);
 listingRouter.put('/admin/:productId/acceptance-rate', authUser, updateAcceptanceRate);
