@@ -215,6 +215,7 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
       length: finalPhone.length 
     });
 
+
     // Validate phone format (SWIFT API accepts: 0798765432 or 254798765432)
     // Kenyan mobile numbers: 0 followed by 7 or 1, then 8 digits = 10 digits total
     // Example: 07114672193 (0 + 7 + 114672193) or 0114672193 (0 + 1 + 14672193)
@@ -283,6 +284,8 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
       endpoint: '/stk-initiate/',
       baseURL: SWIFT_BASE_URL
     });
+
+    console.log('Swift Payload:', swiftPayload);
 
     const swiftPayload = {
       amount: Math.round(order.totalAmount),  // Integer KES
