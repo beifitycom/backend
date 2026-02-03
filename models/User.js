@@ -57,7 +57,6 @@ const UserSchema = new mongoose.Schema(
         unique: true,
         trim: true,
         lowercase: true,
-        index: true,
       },
       verified: {
         type: Boolean,
@@ -78,7 +77,6 @@ const UserSchema = new mongoose.Schema(
           validator: (v) => /^\+?[0-9]{7,15}$/.test(v),
           message: 'Invalid phone number',
         },
-        index: true,
       },
       location: {
         type: LocationSchema,
