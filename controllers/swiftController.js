@@ -75,13 +75,18 @@ export const manualSwiftTest = async (reference) => {
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.beifity.com';
 const commissionRate = parseFloat(process.env.COMMISSION_RATE || '0'); // 5% platform commission
+
+// SWIFT API v3 configuration - Always use v3 endpoint
+const SWIFT_BASE_URL = 'https://swiftwallet.co.ke/v3/';
 const swift = axios.create({
-  baseURL: process.env.SWIFT_BASE_URL || 'https://swiftwallet.co.ke/v3/',
+  baseURL: SWIFT_BASE_URL, // Force v3 API - don't allow env override to old v2
   headers: { 
     'Authorization': `Bearer ${process.env.SWIFT_API_KEY}`,
     'Content-Type': 'application/json',
   },
 });
+
+logger.info('SWIFT API configured', { baseURL: SWIFT_BASE_URL, endpoint: '/stk-initiate/' });
 
 // Utility function for retry logic
 const withRetry = async (fn, maxRetries, description) => {
@@ -181,29 +186,29 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
     const rawPhone = (phone || buyerPhone).toString().trim().replace(/[\s-]/g, '');
     let finalPhone = rawPhone;
     
-    // Handle +254 format from frontend (+254114672193 -> 07114672193)
+    // Always convert to 0 format for SWIFT API (preferred format)
+    // Handle +254 format from frontend (+254114672193 -> 0114672193)
     if (rawPhone.startsWith('+254')) {
-      // Remove + and convert to 0 format: +254114672193 -> 07114672193
-      finalPhone = '0' + rawPhone.substring(4); // Skip '+254' (4 chars), take rest
+      // Remove + and convert to 0 format: +254114672193 -> 0114672193
+      finalPhone = '0' + rawPhone.substring(4); // Skip '+254' (4 chars), take rest (9 digits)
     }
-    // Handle 254 format (254114672193 -> 07114672193)
-    else if (rawPhone.startsWith('254') && rawPhone.length === 12) {
-      finalPhone = '0' + rawPhone.substring(3); // Skip '254' (3 chars), take rest
+    // Handle 254 format (254114672193 -> 0114672193)
+    else if (rawPhone.startsWith('254')) {
+      // Convert to 0 format: 254114672193 -> 0114672193
+      finalPhone = '0' + rawPhone.substring(3); // Skip '254' (3 chars), take rest (9 digits)
     }
-    // Handle 254 format with extra digits
-    else if (rawPhone.startsWith('254') && rawPhone.length > 12) {
-      finalPhone = '0' + rawPhone.substring(3);
-    }
-    // If phone already starts with 0, use as is (07114672193)
+    // If phone already starts with 0, validate and use as is (07114672193 or 0114672193)
     else if (rawPhone.startsWith('0') && rawPhone.length === 10) {
       finalPhone = rawPhone;
     }
-    // If phone starts with 254 but wrong length, try to fix
-    else if (rawPhone.startsWith('254')) {
-      finalPhone = '0' + rawPhone.substring(3);
+    // If phone doesn't match expected patterns, try to fix
+    else if (rawPhone.length >= 9) {
+      // Try to extract the last 9 digits and prepend 0
+      const last9Digits = rawPhone.slice(-9);
+      finalPhone = '0' + last9Digits;
     }
     
-    console.log('Phone normalization:', { 
+    logger.info('Phone normalization:', { 
       input: phone || buyerPhone, 
       rawPhone, 
       finalPhone,
@@ -215,13 +220,13 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
     // Example: 07114672193 (0 + 7 + 114672193) or 0114672193 (0 + 1 + 14672193)
     const phoneRegex = /^0[17]\d{8}$/; // 0 followed by 7 or 1, then exactly 8 digits
     if (!phoneRegex.test(finalPhone)) {
-      // Try 254 format as fallback (12 digits: 254 + 7/1 + 8 digits)
+      // If 0 format doesn't work, try 254 format as fallback
       const phoneRegex254 = /^254[17]\d{8}$/;
       if (phoneRegex254.test(rawPhone)) {
         finalPhone = rawPhone; // Use 254 format if valid
-        logger.info(`Using 254 format for phone: ${finalPhone}`, { orderId: order.orderId });
+        logger.warn(`Using 254 format for phone (0 format validation failed): ${finalPhone}`, { orderId: order.orderId });
       } else {
-        throw new Error(`Invalid phone format: ${rawPhone} (normalized: ${finalPhone}). Expected format: +254XXXXXXXXX (13 chars), 254XXXXXXXXX (12 chars), or 07XXXXXXXX (10 chars).`);
+        throw new Error(`Invalid phone format: ${rawPhone} (normalized: ${finalPhone}). Expected format: +254XXXXXXXXX, 254XXXXXXXXX, or 07XXXXXXXX.`);
       }
     }
     
@@ -268,9 +273,20 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
     await orderModel.findByIdAndUpdate(orderIdObj, { transactionId: transaction._id }, { session });
 
     // Prepare SWIFT API payload (v3 STK Push API)
+    // Ensure phone is in correct format (prefer 0 format: 07114672193)
+    const phoneForAPI = finalPhone.startsWith('0') ? finalPhone : ('0' + finalPhone.substring(3));
+    
+    logger.info('Preparing SWIFT STK Push payload', {
+      orderId: order.orderId,
+      amount: Math.round(order.totalAmount),
+      phone_number: phoneForAPI,
+      endpoint: '/stk-initiate/',
+      baseURL: SWIFT_BASE_URL
+    });
+
     const swiftPayload = {
       amount: Math.round(order.totalAmount),  // Integer KES
-      phone_number: finalPhone,  // Format: 0798765432 or 254798765432
+      phone_number: phoneForAPI,  // Always use 0 format: 07114672193
       external_reference: `ORDER-${order.orderId}`,  // Optional: External reference for tracking
       callback_url: `${process.env.DOMAIN || 'https://beifity-com-backend.onrender.com'}/api/payments/webhook/swift`,
     };
