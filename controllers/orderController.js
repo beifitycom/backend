@@ -250,7 +250,118 @@ export const placeOrder = async (req, res) => {
       logger.warn(`Failed to create buyer initiation notification: ${notificationError.message}`, { orderId: savedOrder.orderId });
     }
 
-    // No full emails or seller notifications here—defer to webhook for deduplication
+    // Send order confirmation emails immediately when order is placed
+    try {
+      const orderTime = savedOrder.createdAt.toLocaleString('en-US', { timeZone: 'Africa/Nairobi' });
+      const buyerName = sanitizeHtml(user.personalInfo?.fullname || 'Customer');
+      
+      // Send email to buyer
+      if (user.personalInfo?.email) {
+        const buyerEmailContent = generateOrderEmailBuyer(
+          buyerName,
+          savedOrder.items.filter(item => !item.cancelled),
+          orderTime,
+          savedOrder.totalAmount,
+          savedOrder.deliveryAddress,
+          savedOrder.orderId,
+          [...new Set(savedOrder.items.filter(item => !item.cancelled).map(item => item.sellerId.toString()))],
+          null
+        ).replace('has been placed', 'has been placed. Please complete payment on your phone when prompted.');
+        
+        const buyerEmailSent = await sendEmail(
+          user.personalInfo.email,
+          'Order Placed - BeiFity.Com',
+          buyerEmailContent
+        );
+        if (buyerEmailSent) {
+          logger.info(`Order placement email sent to buyer ${customerId}`, { orderId: savedOrder.orderId });
+        } else {
+          logger.warn(`Failed to send order placement email to buyer ${customerId}`, { orderId: savedOrder.orderId });
+        }
+      }
+
+      // Send emails to sellers (grouped by seller)
+      const sellerGroups = {};
+      for (const item of savedOrder.items.filter(i => !i.cancelled)) {
+        const sellerIdStr = item.sellerId.toString();
+        if (!sellerGroups[sellerIdStr]) {
+          sellerGroups[sellerIdStr] = [];
+        }
+        sellerGroups[sellerIdStr].push(item);
+      }
+
+      for (const [sellerIdStr, sellerItems] of Object.entries(sellerGroups)) {
+        try {
+          const seller = await userModel.findById(sellerIdStr);
+          if (seller && seller.personalInfo?.email) {
+            const sellerName = sanitizeHtml(seller.personalInfo.fullname || 'Seller');
+            const totalPrice = sellerItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
+            
+            const sellerEmailContent = generateOrderEmailSeller(
+              sellerName,
+              buyerName,
+              sellerItems,
+              orderTime,
+              savedOrder.deliveryAddress,
+              totalPrice,
+              user._id,
+              savedOrder.orderId,
+              null
+            ).replace('You have a new order', 'You have a new order (payment pending)');
+            
+            const sellerEmailSent = await sendEmail(
+              seller.personalInfo.email,
+              'New Order Received - BeiFity.Com',
+              sellerEmailContent
+            );
+            if (sellerEmailSent) {
+              logger.info(`Order placement email sent to seller ${sellerIdStr}`, { orderId: savedOrder.orderId });
+            } else {
+              logger.warn(`Failed to send order placement email to seller ${sellerIdStr}`, { orderId: savedOrder.orderId });
+            }
+          }
+        } catch (sellerEmailError) {
+          logger.warn(`Error sending email to seller ${sellerIdStr}: ${sellerEmailError.message}`, { orderId: savedOrder.orderId });
+        }
+      }
+
+      // Send email to admins
+      const admins = await userModel.find({ 'personalInfo.isAdmin': true }).select('personalInfo.email personalInfo.fullname');
+      for (const admin of admins) {
+        if (admin.personalInfo?.email) {
+          try {
+            const adminEmailContent = generateOrderEmailAdmin(
+              buyerName,
+              savedOrder.items.filter(item => !item.cancelled),
+              orderTime,
+              savedOrder.totalAmount,
+              savedOrder.deliveryAddress,
+              savedOrder.orderId,
+              user._id
+            ).replace('has been placed', 'has been placed (payment pending)');
+            
+            const adminEmailSent = await sendEmail(
+              admin.personalInfo.email,
+              'New Order Placed - BeiFity.Com Admin Notification',
+              adminEmailContent
+            );
+            if (adminEmailSent) {
+              logger.info(`Order placement email sent to admin ${admin._id}`, { orderId: savedOrder.orderId });
+            } else {
+              logger.warn(`Failed to send order placement email to admin ${admin._id}`, { orderId: savedOrder.orderId });
+            }
+          } catch (adminEmailError) {
+            logger.warn(`Error sending email to admin ${admin._id}: ${adminEmailError.message}`, { orderId: savedOrder.orderId });
+          }
+        }
+      }
+    } catch (emailError) {
+      logger.error(`Error sending order placement emails: ${emailError.message}`, { 
+        stack: emailError.stack, 
+        orderId: savedOrder.orderId 
+      });
+      // Don't fail the order if emails fail
+    }
 
     // Prepare poll URL for frontend
     const apiBaseUrl = process.env.API_BASE_URL || req.protocol + '://' + req.get('host');

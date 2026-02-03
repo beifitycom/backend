@@ -176,34 +176,60 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
     }
 
     // Normalize phone number for SWIFT API (accepts: 0798765432 or 254798765432)
+    // Frontend sends: +254114672193
     // Convert to string and remove any spaces/dashes
-    const rawPhone = (phone || buyerPhone).toString().replace(/[\s-]/g, '');
+    const rawPhone = (phone || buyerPhone).toString().trim().replace(/[\s-]/g, '');
     let finalPhone = rawPhone;
     
-    // If phone starts with 254, convert to 0 format (254798765432 -> 0798765432)
-    if (rawPhone.startsWith('254') && rawPhone.length === 12) {
+    // Handle +254 format from frontend (+254114672193 -> 07114672193)
+    if (rawPhone.startsWith('+254')) {
+      // Remove + and convert to 0 format: +254114672193 -> 07114672193
+      finalPhone = '0' + rawPhone.substring(4); // Skip '+254' (4 chars), take rest
+    }
+    // Handle 254 format (254114672193 -> 07114672193)
+    else if (rawPhone.startsWith('254') && rawPhone.length === 12) {
+      finalPhone = '0' + rawPhone.substring(3); // Skip '254' (3 chars), take rest
+    }
+    // Handle 254 format with extra digits
+    else if (rawPhone.startsWith('254') && rawPhone.length > 12) {
       finalPhone = '0' + rawPhone.substring(3);
     }
-    // If phone starts with +254, remove + and convert to 0 format
-    else if (rawPhone.startsWith('+254') && rawPhone.length === 13) {
-      finalPhone = '0' + rawPhone.substring(4);
-    }
-    // If phone already starts with 0, use as is
+    // If phone already starts with 0, use as is (07114672193)
     else if (rawPhone.startsWith('0') && rawPhone.length === 10) {
       finalPhone = rawPhone;
     }
     // If phone starts with 254 but wrong length, try to fix
-    else if (rawPhone.startsWith('254') && rawPhone.length > 12) {
+    else if (rawPhone.startsWith('254')) {
       finalPhone = '0' + rawPhone.substring(3);
     }
     
-    console.log('Phone normalization:', { rawPhone, finalPhone });
+    console.log('Phone normalization:', { 
+      input: phone || buyerPhone, 
+      rawPhone, 
+      finalPhone,
+      length: finalPhone.length 
+    });
 
     // Validate phone format (SWIFT API accepts: 0798765432 or 254798765432)
-    const phoneRegex = /^(254[17]\d{8}|07[17]\d{8})$/;
+    // Kenyan mobile numbers: 0 followed by 7 or 1, then 8 digits = 10 digits total
+    // Example: 07114672193 (0 + 7 + 114672193) or 0114672193 (0 + 1 + 14672193)
+    const phoneRegex = /^0[17]\d{8}$/; // 0 followed by 7 or 1, then exactly 8 digits
     if (!phoneRegex.test(finalPhone)) {
-      throw new Error(`Invalid phone format: ${finalPhone}. Expected format: 0798765432 or 254798765432.`);
+      // Try 254 format as fallback (12 digits: 254 + 7/1 + 8 digits)
+      const phoneRegex254 = /^254[17]\d{8}$/;
+      if (phoneRegex254.test(rawPhone)) {
+        finalPhone = rawPhone; // Use 254 format if valid
+        logger.info(`Using 254 format for phone: ${finalPhone}`, { orderId: order.orderId });
+      } else {
+        throw new Error(`Invalid phone format: ${rawPhone} (normalized: ${finalPhone}). Expected format: +254XXXXXXXXX (13 chars), 254XXXXXXXXX (12 chars), or 07XXXXXXXX (10 chars).`);
+      }
     }
+    
+    logger.info(`Phone number normalized successfully`, { 
+      original: phone || buyerPhone, 
+      normalized: finalPhone,
+      format: finalPhone.startsWith('0') ? '0-format' : '254-format'
+    });
 
     // Create Transaction (pre-save hook will calculate fees/shares)
     const transaction = new TransactionModel({
@@ -1400,8 +1426,9 @@ export const handleSwiftWebhook = async (req, res) => {
           .catch(err => logger.warn(`Failed to create buyer confirmation notification: ${err.message}`, { orderId: order.orderId })),
 
         (async () => {
-          if (buyer.preferences?.emailNotifications) {
-            logger.debug('Sending buyer email');
+          // Always send payment confirmation email (critical notification)
+          if (buyer.personalInfo?.email) {
+            logger.debug('Sending buyer payment confirmation email');
             const buyerEmailContent = generateOrderEmailBuyer(
               buyerName,
               order.items.filter(item => !item.cancelled),
@@ -1412,10 +1439,14 @@ export const handleSwiftWebhook = async (req, res) => {
               [...new Set(order.items.filter(item => !item.cancelled).map(item => item.sellerId.toString()))],
               null  // No URL
             ).replace('has been placed', 'payment has been confirmed and is now processing');
-            await sendEmail(buyer.personalInfo.email, 'Order Confirmed - BeiFity.Com', buyerEmailContent);
-            logger.info(`Order confirmation email sent to buyer ${buyer._id}`, { orderId: order.orderId });
+            const emailSent = await sendEmail(buyer.personalInfo.email, 'Payment Confirmed - Order Processing - BeiFity.Com', buyerEmailContent);
+            if (emailSent) {
+              logger.info(`Payment confirmation email sent to buyer ${buyer._id}`, { orderId: order.orderId });
+            } else {
+              logger.warn(`Failed to send payment confirmation email to buyer ${buyer._id}`, { orderId: order.orderId });
+            }
           } else {
-            logger.info(`Buyer ${buyer._id} has email notifications disabled`, { orderId: order.orderId });
+            logger.warn(`Buyer ${buyer._id} has no email address`, { orderId: order.orderId });
           }
         })().catch(err => logger.warn(`Failed buyer email: ${err.message}`, { orderId: order.orderId }))
       );
@@ -1438,8 +1469,9 @@ export const handleSwiftWebhook = async (req, res) => {
           // Parallel email + notification for this seller
           await Promise.all([
             (async () => {
-              if (seller.preferences?.emailNotifications) {
-                logger.debug(`Sending email to seller ${sellerIdStr}`);
+              // Always send payment confirmation email to seller (critical notification)
+              if (seller.personalInfo?.email) {
+                logger.debug(`Sending payment confirmation email to seller ${sellerIdStr}`);
                 const sellerEmailContent = generateOrderEmailSeller(
                   sellerName,
                   buyerName,
@@ -1451,10 +1483,14 @@ export const handleSwiftWebhook = async (req, res) => {
                   order.orderId,
                   null
                 ).replace('You have a new order', 'Payment confirmed for your new order');
-                await sendEmail(seller.personalInfo.email, 'New Order Confirmed - BeiFity.Com', sellerEmailContent);
-                logger.info(`Order confirmation email sent to seller ${sellerIdStr}`, { orderId: order.orderId });
+                const emailSent = await sendEmail(seller.personalInfo.email, 'Payment Confirmed - New Order - BeiFity.Com', sellerEmailContent);
+                if (emailSent) {
+                  logger.info(`Payment confirmation email sent to seller ${sellerIdStr}`, { orderId: order.orderId });
+                } else {
+                  logger.warn(`Failed to send payment confirmation email to seller ${sellerIdStr}`, { orderId: order.orderId });
+                }
               } else {
-                logger.info(`Seller ${sellerIdStr} has email notifications disabled`, { orderId: order.orderId });
+                logger.warn(`Seller ${sellerIdStr} has no email address`, { orderId: order.orderId });
               }
             })().catch(err => logger.warn(`Failed seller ${sellerIdStr} email: ${err.message}`, { orderId: order.orderId })),
 
@@ -1493,11 +1529,11 @@ export const handleSwiftWebhook = async (req, res) => {
             );
             logger.info(`Order confirmation notification created for admin ${admin._id}`, { orderId: order.orderId });
           }).concat(
-            // Parallel emails for admins with notifications enabled
+            // Parallel emails for all admins (always send payment confirmation emails)
             admins
-              .filter(admin => admin.personalInfo?.email && admin.preferences?.emailNotifications)
+              .filter(admin => admin.personalInfo?.email)
               .map(async (admin) => {
-                logger.debug(`Sending email to admin ${admin._id}`);
+                logger.debug(`Sending payment confirmation email to admin ${admin._id}`);
                 const adminEmailContent = generateOrderEmailAdmin(
                   buyerName,
                   order.items.filter(item => !item.cancelled),
@@ -1507,8 +1543,12 @@ export const handleSwiftWebhook = async (req, res) => {
                   order.orderId,
                   buyer._id
                 ).replace('has been placed', 'has been paid and confirmed');
-                await sendEmail(admin.personalInfo.email, 'New Order Confirmed - BeiFity.Com Admin Notification', adminEmailContent);
-                logger.info(`Order confirmation email sent to admin ${admin._id}`, { orderId: order.orderId });
+                const emailSent = await sendEmail(admin.personalInfo.email, 'Payment Confirmed - New Order - BeiFity.Com Admin Notification', adminEmailContent);
+                if (emailSent) {
+                  logger.info(`Payment confirmation email sent to admin ${admin._id}`, { orderId: order.orderId });
+                } else {
+                  logger.warn(`Failed to send payment confirmation email to admin ${admin._id}`, { orderId: order.orderId });
+                }
               })
           )
         ).catch(err => logger.warn(`Failed admin processing: ${err.message}`, { orderId: order.orderId }));
