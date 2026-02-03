@@ -76,7 +76,7 @@ export const manualSwiftTest = async (reference) => {
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.beifity.com';
 const commissionRate = parseFloat(process.env.COMMISSION_RATE || '0'); // 5% platform commission
 const swift = axios.create({
-  baseURL: process.env.SWIFT_BASE_URL || 'https://swiftwallet.co.ke/pay-app-v2/',
+  baseURL: process.env.SWIFT_BASE_URL || 'https://swiftwallet.co.ke/v3/',
   headers: { 
     'Authorization': `Bearer ${process.env.SWIFT_API_KEY}`,
     'Content-Type': 'application/json',
@@ -175,8 +175,35 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
       throw new Error('Buyer phone number required for M-Pesa payment');
     }
 
-    const finalPhone = phone ? phone.slice(1) : buyerPhone.slice(1); 
-    console.log('Final phone for STK:', finalPhone);
+    // Normalize phone number for SWIFT API (accepts: 0798765432 or 254798765432)
+    // Convert to string and remove any spaces/dashes
+    const rawPhone = (phone || buyerPhone).toString().replace(/[\s-]/g, '');
+    let finalPhone = rawPhone;
+    
+    // If phone starts with 254, convert to 0 format (254798765432 -> 0798765432)
+    if (rawPhone.startsWith('254') && rawPhone.length === 12) {
+      finalPhone = '0' + rawPhone.substring(3);
+    }
+    // If phone starts with +254, remove + and convert to 0 format
+    else if (rawPhone.startsWith('+254') && rawPhone.length === 13) {
+      finalPhone = '0' + rawPhone.substring(4);
+    }
+    // If phone already starts with 0, use as is
+    else if (rawPhone.startsWith('0') && rawPhone.length === 10) {
+      finalPhone = rawPhone;
+    }
+    // If phone starts with 254 but wrong length, try to fix
+    else if (rawPhone.startsWith('254') && rawPhone.length > 12) {
+      finalPhone = '0' + rawPhone.substring(3);
+    }
+    
+    console.log('Phone normalization:', { rawPhone, finalPhone });
+
+    // Validate phone format (SWIFT API accepts: 0798765432 or 254798765432)
+    const phoneRegex = /^(254[17]\d{8}|07[17]\d{8})$/;
+    if (!phoneRegex.test(finalPhone)) {
+      throw new Error(`Invalid phone format: ${finalPhone}. Expected format: 0798765432 or 254798765432.`);
+    }
 
     // Create Transaction (pre-save hook will calculate fees/shares)
     const transaction = new TransactionModel({
@@ -214,45 +241,73 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
     // Link transaction to order
     await orderModel.findByIdAndUpdate(orderIdObj, { transactionId: transaction._id }, { session });
 
-    const phoneRegex = /^254[17]\d{8}$|^07[17]\d{8}$/;
-    if (!phoneRegex.test(finalPhone)) {
-      throw new Error(`Invalid phone format: ${finalPhone}. Expected 254XXXXXXXXX or 07XXXXXXXX.`);
-    }
-
-    // Prepare SWIFT API payload
+    // Prepare SWIFT API payload (v3 STK Push API)
     const swiftPayload = {
       amount: Math.round(order.totalAmount),  // Integer KES
-      phone_number: finalPhone,  // Use provided or buyer's
-      channel_id: process.env.SWIFT_CHANNEL_ID || "000146",  // From env if set
-      account_reference: `ORDER-${order.orderId}`,
-      transaction_desc: `Payment for Order #${order.orderId}`,
+      phone_number: finalPhone,  // Format: 0798765432 or 254798765432
+      external_reference: `ORDER-${order.orderId}`,  // Optional: External reference for tracking
       callback_url: `${process.env.DOMAIN || 'https://beifity-com-backend.onrender.com'}/api/payments/webhook/swift`,
     };
 
-    // Call SWIFT API
+    // Add optional channel_id if available (must be integer)
+    if (process.env.SWIFT_CHANNEL_ID) {
+      const channelId = parseInt(process.env.SWIFT_CHANNEL_ID);
+      if (!isNaN(channelId)) {
+        swiftPayload.channel_id = channelId;
+      }
+    }
+    
+    // Add optional customer name if available
+    if (order.customerId?.personalInfo?.fullname) {
+      swiftPayload.customer_name = order.customerId.personalInfo.fullname;
+    }
+
+    // Call SWIFT API - Use v3 STK Push endpoint
     const response = await withRetry(
-      () => swift.post('/payments.php', swiftPayload),
+      () => swift.post('/stk-initiate/', swiftPayload),
       3,
       `Initialize SWIFT payment for order ${order.orderId}`
     );
 
     const swiftData = response.data;
-    console.log('SWIFT Init Response:', swiftData);  // Debug log
+    console.log('SWIFT STK Init Response:', JSON.stringify(swiftData, null, 2));  // Debug log
 
     if (!swiftData.success) {
       // Rollback on failure
       await transaction.deleteOne({ session });
       await orderModel.findByIdAndUpdate(orderIdObj, { $unset: { transactionId: '' } }, { session });
-      logger.error(`SWIFT payment initialization failed: ${swiftData.message}`, { orderId: order.orderId, response: swiftData });
+      logger.error(`SWIFT payment initialization failed: ${swiftData.message}`, { 
+        orderId: order.orderId, 
+        status: swiftData.status,
+        response: swiftData 
+      });
       throw new Error(swiftData.message || 'Payment initiation failed');
     }
 
     // Update transaction with real reference and status
-    transaction.swiftReference = swiftData.reference || swiftData.external_reference || transaction.swiftReference;
+    // API response structure: { success: true, status: "INITIATED", reference, transaction_id, checkout_request_id, merchant_request_id }
+    // Use reference (which is the external_reference we sent) or fallback to transaction_id
+    transaction.swiftReference = swiftData.reference || swiftData.external_reference || `TX-${swiftData.transaction_id}` || transaction.swiftReference;
     transaction.status = 'swift_initiated';
+    
+    // Store additional transaction details if available
+    if (swiftData.transaction_id) {
+      transaction.swiftTransactionId = swiftData.transaction_id.toString();
+    }
+    if (swiftData.checkout_request_id) {
+      transaction.swiftCheckoutRequestId = swiftData.checkout_request_id;
+    }
+    if (swiftData.merchant_request_id) {
+      transaction.swiftMerchantRequestId = swiftData.merchant_request_id;
+    }
     await transaction.save({ session });
 
-    logger.info(`SWIFT payment initialized for order ${order.orderId}`, { swiftReference: transaction.swiftReference });
+    logger.info(`SWIFT STK Push initialized for order ${order.orderId}`, { 
+      swiftReference: transaction.swiftReference,
+      transactionId: swiftData.transaction_id,
+      status: swiftData.status,
+      message: swiftData.message
+    });
     return {
       error: false,
       authorization_url: null,  // STK Push has no URL
@@ -260,6 +315,17 @@ export const initializePayment = async (orderIdObj, session, email, deliveryFee,
     };
   } catch (error) {
     console.log('Payment init error:', error);
+    // Provide clearer error message for 404 errors
+    if (error.response?.status === 404) {
+      const errorMsg = `SWIFT API endpoint not found. Please verify the payment endpoint is correct. Status: ${error.response.status}`;
+      logger.error(`Error initializing payment: ${errorMsg}`, { 
+        stack: error.stack, 
+        orderId: orderIdObj,
+        url: error.config?.url,
+        baseURL: error.config?.baseURL
+      });
+      return { error: true, message: errorMsg };
+    }
     logger.error(`Error initializing payment: ${error.message}`, { stack: error.stack, orderId: orderIdObj });
     return { error: true, message: error.message };
   }
